@@ -1,11 +1,13 @@
 """海量文件迁移引擎（后端核心）。
 
-设计要点（面向百万级文件）：
-- 扫描阶段流式统计文件数 / 总大小，不在内存中保留文件清单，内存占用恒定。
+设计要点（面向亿级文件）：
+- 扫描阶段目录级并行 + 流式统计文件数 / 总大小，不在内存中保留文件清单，内存占用恒定；
+  扫描进度实时回写任务统计，进程崩溃可从持久化快照保留部分统计。
 - 拷贝阶段使用「有界队列 + 固定线程数」的生产者/消费者模型，避免一次性提交海量任务。
 - 写入使用 ``*.part`` 临时文件 + 原子替换，任务中断/取消不会留下半截目标文件。
 - 增量模式：目标文件大小与 mtime 一致则跳过。
-- 校验阶段：先比对目录结构（文件数 / 总大小 / 软链接数），再对同名文件做 MD5 比对。
+- 校验阶段：多线程 MD5 比对同名文件（复用拷贝的生产者/消费者模型）；
+  拷贝零失败时跳过目标结构扫描，省一轮全量枚举。
 - 支持暂停 / 恢复 / 取消 / 限速（MB/s）；速度采用滑动窗口统计。
 """
 
@@ -583,10 +585,16 @@ class Engine:
             self.log("INFO", f"源目录: {task.source}", task)
             self.log("INFO", f"目标目录: {task.dest}", task)
 
-            # 1) 扫描
+            # 1) 扫描（目录级并行，进度实时回写任务统计，中途崩溃可保留部分统计）
             task.status = "scanning"
             self._schedule_persist()
-            files, total, links = self._scan(task, task.source)
+
+            def _on_scan_progress(f: int, b: int) -> None:
+                task.files_total = f
+                task.bytes_total = b
+                task.message = f"已统计 {f} 个文件 / {human_size(b)}"
+
+            files, total, links = self._scan(task, task.source, _on_scan_progress)
             task.files_total = files
             task.bytes_total = total
             task.source_links = links
@@ -619,6 +627,11 @@ class Engine:
                 task.status = "verifying"
                 self._schedule_persist()
                 self._verify(task)
+                if task.cancelled:
+                    task.status = "cancelled"
+                    task.finished = time.time()
+                    self.log("WARN", f"任务已取消: 校验进行到 {task.verify_done}/{task.verify_total}", task)
+                    return
 
             task.files_total = task.files_total or task.files_done
             task.bytes_total = task.bytes_total or task.bytes_done
@@ -643,35 +656,78 @@ class Engine:
                 self._persist_now()
 
     # -- 扫描 -------------------------------------------------------------- #
-    def _scan(self, task: Task, root: str) -> tuple[int, int, int]:
-        files = 0
-        total = 0
-        links = 0
-        stack = [root]
-        while stack:
-            if task.cancelled:
-                return files, total, links
-            cur = stack.pop()
-            try:
-                with os.scandir(longpath(cur)) as it:
-                    for entry in it:
-                        try:
-                            if entry.is_symlink():
-                                links += 1
-                                if not task.options["follow_symlinks"]:
-                                    continue
-                            if entry.is_dir(follow_symlinks=task.options["follow_symlinks"]):
-                                stack.append(entry.path)
-                            elif entry.is_file(follow_symlinks=task.options["follow_symlinks"]):
-                                files += 1
-                                total += entry.stat().st_size
-                        except OSError:
-                            continue
-                        if files % 20000 == 0 and files:
-                            task.message = f"已统计 {files} 个文件 / {human_size(total)}"
-            except OSError as exc:
-                self.log("ERROR", f"扫描失败 {cur}: {exc}", task)
-        return files, total, links
+    def _scan(self, task: Task, root: str, on_progress=None) -> tuple[int, int, int]:
+        """目录级并行扫描：N 个线程共享一个目录队列，流式累计文件数/总大小/软链接数。
+
+        - 不保留文件清单，内存占用恒定（仅目录队列）。
+        - on_progress(files, total)：每约 2 万个文件回调一次，供调用方实时更新统计。
+        - 取消时尽快收敛，返回已统计的部分结果。
+        """
+        lock = threading.Lock()
+        counts = {"files": 0, "total": 0, "links": 0, "pending": 1, "reported": 0}
+        q: queue.Queue = queue.Queue()
+        q.put(root)
+        stop = threading.Event()
+        workers_n = min(16, max(4, (os.cpu_count() or 4) * 2))
+
+        def worker() -> None:
+            while not stop.is_set():
+                try:
+                    cur = q.get(timeout=0.1)
+                except queue.Empty:
+                    with lock:
+                        if counts["pending"] == 0:
+                            return
+                    continue
+                subdirs: list[str] = []
+                try:
+                    with os.scandir(longpath(cur)) as it:
+                        for entry in it:
+                            try:
+                                if entry.is_symlink():
+                                    with lock:
+                                        counts["links"] += 1
+                                    if not task.options["follow_symlinks"]:
+                                        continue
+                                if entry.is_dir(follow_symlinks=task.options["follow_symlinks"]):
+                                    subdirs.append(entry.path)
+                                elif entry.is_file(follow_symlinks=task.options["follow_symlinks"]):
+                                    with lock:
+                                        counts["files"] += 1
+                                        counts["total"] += entry.stat().st_size
+                            except OSError:
+                                continue
+                except OSError as exc:
+                    self.log("ERROR", f"扫描失败 {cur}: {exc}", task)
+                    subdirs = []
+                if subdirs:
+                    with lock:
+                        counts["pending"] += len(subdirs)
+                    for d in subdirs:
+                        q.put(d)
+                with lock:
+                    counts["pending"] -= 1
+                    report = None
+                    if on_progress and counts["files"] - counts["reported"] >= 20000:
+                        counts["reported"] = counts["files"]
+                        report = (counts["files"], counts["total"])
+                if report:
+                    on_progress(*report)
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers_n)]
+        for t in threads:
+            t.start()
+        try:
+            for t in threads:
+                while t.is_alive():
+                    t.join(timeout=0.2)
+                    if task.cancelled:
+                        stop.set()
+        finally:
+            stop.set()
+            for t in threads:
+                t.join(timeout=1.0)
+        return counts["files"], counts["total"], counts["links"]
 
     def _walk_files(self, root: str):
         """流式产出 (绝对路径, 相对路径)，不保留清单。"""
@@ -807,51 +863,85 @@ class Engine:
     # -- 校验 -------------------------------------------------------------- #
     def _verify(self, task: Task) -> None:
         self.log("INFO", "校验结果:", task)
-        d_files, d_total, d_links = self._scan(task, task.dest)
-        task.dest_links = d_links
-        self.log("INFO", f"文件数: 源 {task.files_total} vs 目标 {d_files} "
-                         f"{'一致' if d_files >= task.files_total else '不一致'}", task)
-        self.log("INFO", f"总大小: 源 {human_size(task.bytes_total)} vs 目标 {human_size(d_total)} "
-                         f"{'一致' if d_total >= task.bytes_total else '不一致'}", task)
-        self.log("INFO", f"软链接数: 源 {task.source_links} vs 目标 {d_links} "
-                         f"{'一致' if task.source_links == d_links else '不一致'}", task)
+        if task.files_failed == 0:
+            # 拷贝零失败 → 跳过目标目录全量结构扫描，省一轮亿级枚举（缺失/损坏由哈希校验兜底）
+            self.log("INFO", "拷贝阶段零失败，跳过目标结构扫描，直接进入哈希校验", task)
+        else:
+            d_files, d_total, d_links = self._scan(task, task.dest)
+            task.dest_links = d_links
+            self.log("INFO", f"文件数: 源 {task.files_total} vs 目标 {d_files} "
+                             f"{'一致' if d_files >= task.files_total else '不一致'}", task)
+            self.log("INFO", f"总大小: 源 {human_size(task.bytes_total)} vs 目标 {human_size(d_total)} "
+                             f"{'一致' if d_total >= task.bytes_total else '不一致'}", task)
+            self.log("INFO", f"软链接数: 源 {task.source_links} vs 目标 {d_links} "
+                             f"{'一致' if task.source_links == d_links else '不一致'}", task)
         self.log("INFO", "开始哈希校验（同名文件）...", task)
 
-        task.verify_total = task.files_total
+        task.verify_total = task.files_done or task.files_total
         task.verify_done = 0
-        mismatches = 0
-        root_src, root_dst = task.source, task.dest
-        for src, rel in self._walk_files(root_src):
-            if task.cancelled:
-                return
-            if not task.gate():
-                return
-            dst = os.path.join(root_dst, rel)
-            task.current = rel
-            try:
-                if not os.path.exists(longpath(dst)):
-                    mismatches += 1
-                    self.log("ERROR", f"目标缺失: {rel}", task)
-                    continue
-                if os.stat(longpath(src)).st_size != os.stat(longpath(dst)).st_size:
-                    mismatches += 1
-                    self.log("ERROR", f"大小不一致: {rel}", task)
-                    continue
-                if self._md5(src) != self._md5(dst):
-                    mismatches += 1
-                    self.log("ERROR", f"MD5 不一致: {rel}", task)
-                task.add_bytes(0)
-            except OSError as exc:
-                mismatches += 1
-                self.log("ERROR", f"校验失败: {rel} ({exc})", task)
-            finally:
-                task.verify_done += 1
-        task.md5_mismatch = mismatches
+        task.md5_mismatch = 0
+        workers = max(1, int(task.options["threads"]))
+        q: queue.Queue = queue.Queue(maxsize=workers * 16)
+
+        def worker() -> None:
+            while True:
+                item = q.get()
+                try:
+                    if item is None:
+                        return
+                    self._verify_one(task, item[0], item[1])
+                finally:
+                    q.task_done()
+
+        threads = [threading.Thread(target=worker, daemon=True) for _ in range(workers)]
+        for t in threads:
+            t.start()
+
+        try:
+            for src, rel in self._walk_files(task.source):
+                if task.cancelled:
+                    return
+                if not task.gate():
+                    return
+                task.current = rel
+                q.put((src, rel))
+        finally:
+            for _ in threads:
+                q.put(None)
+            for t in threads:
+                t.join()
+
+        if task.cancelled:
+            return
         task.current = ""
-        if mismatches:
-            self.log("ERROR", f"哈希校验完成: {mismatches} 个文件不一致", task)
+        if task.md5_mismatch:
+            self.log("ERROR", f"哈希校验完成: {task.md5_mismatch} 个文件不一致", task)
         else:
             self.log("SUCCESS", f"哈希校验完成: {task.verify_done} 个文件全部一致", task)
+
+    def _verify_one(self, task: Task, src: str, rel: str) -> None:
+        """工作线程内校验单个文件：存在性 → 大小 → MD5。"""
+        if not task.gate():
+            return
+        dst = os.path.join(task.dest, rel)
+        try:
+            if not os.path.exists(longpath(dst)):
+                self._verify_fail(task, f"目标缺失: {rel}")
+            elif os.stat(longpath(src)).st_size != os.stat(longpath(dst)).st_size:
+                self._verify_fail(task, f"大小不一致: {rel}")
+            elif self._md5(src) != self._md5(dst):
+                self._verify_fail(task, f"MD5 不一致: {rel}")
+            with task._lock:
+                task.verify_done += 1
+        except OSError as exc:
+            self._verify_fail(task, f"校验失败: {rel} ({exc})")
+        except Exception as exc:  # noqa: BLE001
+            self._verify_fail(task, f"校验异常: {rel} ({exc})")
+
+    def _verify_fail(self, task: Task, msg: str) -> None:
+        with task._lock:
+            task.md5_mismatch += 1
+        self.log("ERROR", msg, task)
 
 
 engine = Engine()
