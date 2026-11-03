@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import time
 from contextlib import asynccontextmanager
 
@@ -19,8 +20,9 @@ from pydantic import BaseModel
 
 from engine import engine, longpath, normalize_dest
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-STATIC_DIR = os.path.join(BASE_DIR, "static")
+# PyInstaller 单文件运行时会把资源解压到 sys._MEIPASS
+_BASE_DIR = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+STATIC_DIR = os.path.join(_BASE_DIR, "static")
 
 
 # --------------------------------------------------------------------------- #
