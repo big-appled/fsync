@@ -42,6 +42,11 @@ DEFAULT_OPTIONS = {
     "preserve_mtime": True,
     "follow_symlinks": False,
     "overwrite": True,
+    # 目标目录归一化模式：
+    #   "auto"  自动把源目录 basename 拼到 dest 后面（默认，贴合直觉）
+    #           例：源 /var/log/test + 目标 /home/ningding → 实际拷贝到 /home/ningding/test/
+    #   "exact" 用户填什么用什么（兼容旧行为，目标必须是最终目录）
+    "dest_mode": "auto",
 }
 
 
@@ -75,6 +80,25 @@ def human_speed(bps: float) -> str:
 
 def makedirs(path: str) -> None:
     os.makedirs(longpath(path), exist_ok=True)
+
+
+def normalize_dest(source: str, dest: str, mode: str = "auto") -> str:
+    """根据 dest_mode 把源路径与目标路径归一化成最终的拷贝目标。
+
+    - auto：将源目录的 basename 拼到 dest 后面，得到最终拷贝目录。
+      调用方应在归一化之后再做 s==d / d 在 s 内的安全校验，不要指望此函数兜底。
+    - exact：用户填什么用什么。
+    """
+    source = os.path.abspath(source)
+    dest = os.path.abspath(dest)
+    if mode != "auto":
+        return dest
+    src_name = os.path.basename(source.rstrip("/\\"))
+    # 目标 basename 已经等于源 basename → 用户显式指定了最终目录，不再补
+    if os.path.basename(dest.rstrip("/\\")) == src_name:
+        return dest
+    # 否则一律拼上 basename（调用方负责校验拼完后的安全边界）
+    return os.path.join(dest, src_name)
 
 
 # --------------------------------------------------------------------------- #
@@ -111,13 +135,15 @@ class RateLimiter:
 # 任务
 # --------------------------------------------------------------------------- #
 class Task:
-    def __init__(self, seq: int, name: str, source: str, dest: str, options: dict | None = None):
+    def __init__(self, seq: int, name: str, source: str, dest: str, options: dict | None = None,
+                 storage_dir: str | None = None):
         self.id = uuid.uuid4().hex[:10]
         self.seq = seq
-        self.name = name or os.path.basename(source.rstrip("/\\")) or source
-        self.source = os.path.abspath(source)
-        self.dest = os.path.abspath(dest)
         self.options = {**DEFAULT_OPTIONS, **(options or {})}
+        self.source = os.path.abspath(source)
+        # dest 归一化：根据 options.dest_mode 决定最终目标目录
+        self.dest = normalize_dest(self.source, dest, self.options.get("dest_mode", "auto"))
+        self.name = name or os.path.basename(self.source.rstrip("/\\")) or source
         self.status = "pending"
         self.created = time.time()
         self.started: float | None = None
@@ -142,6 +168,11 @@ class Task:
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
         self.limiter = RateLimiter(self.options["rate_limit_mb"])
+        # ---- task 级独立日志 ----
+        self.task_logs: deque = deque(maxlen=3000)
+        self.task_log_seq = 0
+        self._task_log_file: object | None = None  # 延迟到 Engine 启动时打开
+        self._storage_dir = storage_dir
 
     # -- 状态控制 ---------------------------------------------------------- #
     def add_bytes(self, n: int) -> None:
@@ -277,11 +308,49 @@ class Task:
         t._lock = threading.Lock()
         t._thread = None
         t.limiter = RateLimiter(t.options.get("rate_limit_mb", 0))
+        # 运行态 task 日志（重启后重新打开新文件，不再依赖旧内存 deque）
+        t.task_logs = deque(maxlen=3000)
+        t.task_log_seq = 0
+        t._task_log_file = None
+        t._storage_dir = None
         # 进程中断的任务（上次退出前仍在跑），统一标记为 interrupted + 暂停
         if t.status in ("scanning", "running", "verifying"):
             t.status = "interrupted"
             t._pause.clear()  # 保持暂停，等用户点击继续/重试
         return t
+
+    # -- task 级日志 ------------------------------------------------------ #
+    def open_log_file(self, storage_dir: str) -> None:
+        """打开本任务的专属日志文件（.fsync_data/task_logs/<task_id>.jsonl）。"""
+        try:
+            d = os.path.join(storage_dir, "task_logs")
+            makedirs(d)
+            self._task_log_file = open(os.path.join(d, self.id + ".jsonl"), "a",
+                                       encoding="utf-8", buffering=1)
+        except OSError:
+            self._task_log_file = None
+
+    def close_log_file(self) -> None:
+        try:
+            if self._task_log_file:
+                self._task_log_file.flush()
+                self._task_log_file.close()
+        except OSError:
+            pass
+        self._task_log_file = None
+
+    def append_task_log(self, rec: dict) -> None:
+        with self._lock:
+            self.task_log_seq += 1
+            rec = dict(rec)
+            rec["task_seq_local"] = self.task_log_seq
+            self.task_logs.append(rec)
+        if self._task_log_file:
+            try:
+                self._task_log_file.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                self._task_log_file.flush()
+            except OSError:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -381,6 +450,7 @@ class Engine:
         if storage_dir is None:
             storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fsync_data")
         self.storage = Storage(storage_dir)
+        self.storage_dir = storage_dir
 
         self.tasks: dict[str, Task] = {}
         self.order: list[str] = []
@@ -395,13 +465,43 @@ class Engine:
         # 先还原持久化的任务，再启动监控线程
         self._revive()
 
+        # 为所有现存任务打开专属日志文件
+        for t in self.tasks.values():
+            t.open_log_file(self.storage_dir)
+
         self._monitor = threading.Thread(target=self._monitor_loop, daemon=True)
         self._monitor.start()
 
         atexit.register(self.flush)
 
     # -- 日志 -------------------------------------------------------------- #
-    def log(self, level: str, message: str, task: Task | None = None) -> None:
+    def log(self, level: str, message: str, task: Task | None = None,
+            detail: bool = False) -> None:
+        """写日志。
+
+        - 无 task：始终写系统日志（engine.logs + logs.jsonl）
+        - 有 task + detail=False（概要）：系统日志写一行概要，task 日志写完整 message
+        - 有 task + detail=True（细节，如每个文件的拷贝/校验）：只写 task 日志，不入系统流
+        """
+        if task is None:
+            self._append_system_log(level, message, task)
+            return
+        # 先写 task 专属日志
+        task.append_task_log({
+            "seq": 0,  # task_log_seq 由 Task 自己维护
+            "ts": time.time(),
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+            "level": level,
+            "task_id": task.id,
+            "task_seq": task.seq,
+            "message": message,
+            "detail": detail,
+        })
+        # 概要级 → 也入系统日志；细节级不入，避免系统日志被海量文件记录淹没
+        if not detail:
+            self._append_system_log(level, message, task)
+
+    def _append_system_log(self, level: str, message: str, task: Task | None) -> None:
         with self._lock:
             self.log_seq += 1
             rec = {
@@ -414,7 +514,6 @@ class Engine:
                 "message": message,
             }
             self.logs.append(rec)
-        # 追加到磁盘（不加锁，IO 在 Storage 内部自己兜底）
         try:
             self.storage.append_log(rec)
         except Exception:  # noqa: BLE001
@@ -426,6 +525,22 @@ class Engine:
             if rec["seq"] <= seq:
                 continue
             if task_id and rec["task_id"] != task_id:
+                continue
+            if level and level != "ALL" and rec["level"] != level:
+                continue
+            out.append(rec)
+        return out[-limit:]
+
+    def task_logs_since(self, task_id: str, seq: int = 0, level: str = "",
+                        limit: int = 500) -> list[dict]:
+        """按 task_id 返回专属日志增量。seq 为该 task 的 task_log_seq 起始，0 表示全部。"""
+        task = self.tasks.get(task_id)
+        if not task:
+            return []
+        out = []
+        for rec in task.task_logs:
+            local_seq = rec.get("task_seq_local", 0)
+            if local_seq <= seq:
                 continue
             if level and level != "ALL" and rec["level"] != level:
                 continue
@@ -488,6 +603,8 @@ class Engine:
         try:
             self._persist_now()
             self.storage.close()
+            for t in list(self.tasks.values()):
+                t.close_log_file()
         except Exception:  # noqa: BLE001
             pass
 
@@ -495,9 +612,10 @@ class Engine:
     def create(self, name: str, source: str, dest: str, options: dict | None = None) -> Task:
         with self._lock:
             self._seq += 1
-            task = Task(self._seq, name, source, dest, options)
+            task = Task(self._seq, name, source, dest, options, storage_dir=self.storage_dir)
             self.tasks[task.id] = task
             self.order.append(task.id)
+        task.open_log_file(self.storage_dir)
         self.log("INFO", f"新建任务: {task.source} → {task.dest}", task)
         self._persist_now()  # 新任务立即落盘
         self.start(task)
@@ -542,6 +660,7 @@ class Engine:
         task = self.tasks.pop(task_id, None)
         if task:
             task.cancel()
+            task.close_log_file()
             if task_id in self.order:
                 self.order.remove(task_id)
             self.log("WARN", f"删除任务: {task.name}", task)
@@ -796,12 +915,14 @@ class Engine:
                         task.files_skipped += 1
                         task.files_done += 1
                         task.add_bytes(st.st_size)
+                        self.log("INFO", f"跳过(增量): {rel}", task, detail=True)
                         return
                 except OSError:
                     pass
             if not task.options["overwrite"] and os.path.exists(longpath(dst)):
                 task.files_skipped += 1
                 task.files_done += 1
+                self.log("INFO", f"跳过(已存在): {rel}", task, detail=True)
                 return
 
             makedirs(os.path.dirname(dst) or task.dest)
@@ -828,18 +949,19 @@ class Engine:
             if task.options["preserve_mtime"]:
                 os.utime(longpath(dst), (st.st_atime, st.st_mtime))
             task.files_done += 1
+            self.log("INFO", f"已拷贝: {rel}  {human_size(st.st_size)}", task, detail=True)
             if written != st.st_size:
                 task.files_failed += 1
-                self.log("WARN", f"大小不一致: {rel} 源 {st.st_size} vs 写入 {written}", task)
+                self.log("WARN", f"大小不一致: {rel} 源 {st.st_size} vs 写入 {written}", task, detail=True)
         except PermissionError as exc:
             task.files_failed += 1
             task.files_done += 1
-            self.log("ERROR", f"访问被拒绝: {rel} ({exc})", task)
+            self.log("ERROR", f"访问被拒绝: {rel} ({exc})", task, detail=True)
             self._safe_unlink(tmp)
         except OSError as exc:
             task.files_failed += 1
             task.files_done += 1
-            self.log("ERROR", f"拷贝失败: {rel} ({exc})", task)
+            self.log("ERROR", f"拷贝失败: {rel} ({exc})", task, detail=True)
             self._safe_unlink(tmp)
 
     @staticmethod
@@ -926,22 +1048,34 @@ class Engine:
         dst = os.path.join(task.dest, rel)
         try:
             if not os.path.exists(longpath(dst)):
-                self._verify_fail(task, f"目标缺失: {rel}")
-            elif os.stat(longpath(src)).st_size != os.stat(longpath(dst)).st_size:
-                self._verify_fail(task, f"大小不一致: {rel}")
-            elif self._md5(src) != self._md5(dst):
-                self._verify_fail(task, f"MD5 不一致: {rel}")
+                self._verify_fail(task, rel, "目标缺失", src_md5="", dst_md5="")
+            else:
+                st_src = os.stat(longpath(src)).st_size
+                st_dst = os.stat(longpath(dst)).st_size
+                if st_src != st_dst:
+                    self._verify_fail(task, rel, f"大小不一致 源={st_src} vs 目标={st_dst}",
+                                      src_md5="", dst_md5="")
+                else:
+                    src_md5 = self._md5(src)
+                    dst_md5 = self._md5(dst)
+                    if src_md5 != dst_md5:
+                        self._verify_fail(task, rel, f"MD5 不一致 源={src_md5} vs 目标={dst_md5}",
+                                          src_md5=src_md5, dst_md5=dst_md5)
+                    else:
+                        self.log("INFO", f"校验通过: {rel}  MD5={src_md5}", task, detail=True)
             with task._lock:
                 task.verify_done += 1
         except OSError as exc:
-            self._verify_fail(task, f"校验失败: {rel} ({exc})")
+            self._verify_fail(task, rel, f"校验失败 ({exc})", src_md5="", dst_md5="")
         except Exception as exc:  # noqa: BLE001
-            self._verify_fail(task, f"校验异常: {rel} ({exc})")
+            self._verify_fail(task, rel, f"校验异常 ({exc})", src_md5="", dst_md5="")
 
-    def _verify_fail(self, task: Task, msg: str) -> None:
+    def _verify_fail(self, task: Task, rel: str, reason: str,
+                     src_md5: str = "", dst_md5: str = "") -> None:
         with task._lock:
             task.md5_mismatch += 1
-        self.log("ERROR", msg, task)
+        msg = f"{rel}  |  {reason}"
+        self.log("ERROR", msg, task, detail=True)
 
 
 engine = Engine()

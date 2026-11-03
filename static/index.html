@@ -83,10 +83,13 @@
         </div>
       </section>
 
-      <!-- 系统日志 -->
+      <!-- 日志 -->
       <section class="panel logs">
         <div class="logs-head">
-          <h3>▸ 系统日志</h3>
+          <div class="logs-tabs">
+            <button class="log-tab active" data-tab="system">系统日志</button>
+            <button class="log-tab" data-tab="task">当前任务日志</button>
+          </div>
           <div class="logs-tools">
             <select id="log-filter">
               <option value="ALL">全部</option>
@@ -147,6 +150,13 @@
         <label class="chk"><input type="checkbox" id="in-verify" checked /><span>MD5 校验</span></label>
         <label class="chk"><input type="checkbox" id="in-overwrite" checked /><span>覆盖已存在文件</span></label>
       </div>
+      <label class="field">
+        <span>目标目录模式</span>
+        <select id="in-dest-mode">
+          <option value="auto" selected>auto（自动把源目录名拼到目标后，推荐）</option>
+          <option value="exact">exact（目标即最终目录，不自动补）</option>
+        </select>
+      </label>
       <div class="modal-err" id="modal-err"></div>
     </div>
     <div class="modal-foot">

@@ -8,10 +8,14 @@ const state = {
   aggregate: {},
   selectedId: null,
   checked: new Set(),
-  logs: [],
+  logs: [],          // 系统日志（概要，来自 WS push）
   logFilter: "ALL",
   logSearch: "",
   search: "",
+  // --- 任务专属日志 ---
+  taskLogs: [],      // 当前选中 task 的专属日志
+  taskLogSeq: 0,     // 上次拉到的 task_log_seq_local
+  logPanelMode: "system",  // "system" | "task"
 };
 
 const STATUS_TEXT = {
@@ -69,9 +73,14 @@ function connect() {
     let data;
     try { data = JSON.parse(ev.data); } catch { return; }
     if (data.tasks) { state.tasks = data.tasks; state.aggregate = data.aggregate || {}; }
-    if (data.logs) appendLogs(data.logs);
+    if (data.logs) appendSystemLogs(data.logs);
     if (data.type === "init" && !state.selectedId && state.tasks.length) {
       state.selectedId = state.tasks[0].id;
+      loadTaskLogs(state.selectedId, true);
+    }
+    // WS update 时如果处于 task 日志模式，顺便拉一下该 task 的增量日志
+    if (data.type === "update" && state.logPanelMode === "task" && state.selectedId) {
+      loadTaskLogs(state.selectedId, false);
     }
     render();
   };
@@ -83,20 +92,78 @@ function setConn(on) {
   $("conn-text").textContent = on ? "已连接" : "连接已断开";
 }
 
-function appendLogs(records) {
+function appendSystemLogs(records) {
   if (!records.length) return;
   const box = $("log-list");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
   state.logs.push(...records);
   if (state.logs.length > 2000) state.logs.splice(0, state.logs.length - 2000);
-  renderLogs();
-  if (atBottom) box.scrollTop = box.scrollHeight;
+  // 只有在显示系统日志时才渲染
+  if (state.logPanelMode === "system") {
+    renderLogs();
+    if (atBottom) box.scrollTop = box.scrollHeight;
+  }
+}
+
+// --------------------------------------------------------------------------- //
+// REST 调用
+// --------------------------------------------------------------------------- //
+async function api(method, url, body) {
+  const opt = { method, headers: {} };
+  if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
+  const res = await fetch(url, opt);
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error || `${res.status}`);
+  return data;
+}
+
+// --------------------------------------------------------------------------- //
+// Task 专属日志拉取（增量）
+// --------------------------------------------------------------------------- //
+async function loadTaskLogs(taskId, fullReload) {
+  if (!taskId) return;
+  const after = fullReload ? 0 : state.taskLogSeq;
+  try {
+    const data = await api("GET", `/api/tasks/${taskId}/logs?after=${after}&limit=500`);
+    const newRecords = data.logs || [];
+    const box = $("log-list");
+    const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
+
+    if (fullReload) {
+      state.taskLogs = newRecords;
+    } else if (newRecords.length) {
+      state.taskLogs.push(...newRecords);
+    }
+    state.taskLogSeq = data.task_seq || state.taskLogSeq;
+
+    if (state.taskLogs.length > 5000) state.taskLogs.splice(0, state.taskLogs.length - 5000);
+    if (state.logPanelMode === "task") {
+      renderLogs();
+      if (atBottom) box.scrollTop = box.scrollHeight;
+    }
+  } catch (e) {
+    // 任务不存在 / 后端还没启动，忽略
+  }
+}
+
+// 定时轮询 task 专属日志（仅当显示 task 面板且当前有选中任务时）
+let _taskLogPollTimer = null;
+function startTaskLogPolling() {
+  stopTaskLogPolling();
+  _taskLogPollTimer = setInterval(() => {
+    if (state.logPanelMode === "task" && state.selectedId) {
+      loadTaskLogs(state.selectedId, false);
+    }
+  }, 1500);
+}
+function stopTaskLogPolling() {
+  if (_taskLogPollTimer) { clearInterval(_taskLogPollTimer); _taskLogPollTimer = null; }
 }
 
 // --------------------------------------------------------------------------- //
 // 渲染
 // --------------------------------------------------------------------------- //
-function render() { renderStats(); renderTaskList(); renderDetail(); }
+function render() { renderStats(); renderTaskList(); renderDetail(); renderLogs(); }
 
 function renderStats() {
   const a = state.aggregate || {};
@@ -234,7 +301,7 @@ function updateActionButtons(t) {
 function renderLogs() {
   const box = $("log-list");
   const q = state.logSearch.trim().toLowerCase();
-  const rows = state.logs.filter((r) => {
+  const rows = (state.logPanelMode === "task" ? state.taskLogs : state.logs).filter((r) => {
     if (state.logFilter !== "ALL" && r.level !== state.logFilter) return false;
     if (q && !r.message.toLowerCase().includes(q) && !r.time.includes(q)) return false;
     return true;
@@ -244,22 +311,17 @@ function renderLogs() {
       <span class="t">[${r.time}]</span>
       <span class="lv ${r.level}">${r.level}</span>
       <span class="msg">${esc(r.message)}</span>
-    </div>`).join("");
-  $("log-count").textContent = `${rows.length} / ${state.logs.length} 记录`;
+    </div>`).join("") || `<div class="empty" style="padding:30px">${
+      state.logPanelMode === "task"
+        ? (state.selectedId ? "（暂无任务日志）" : "（未选择任务）")
+        : "（暂无系统日志）"
+    }</div>`;
+  $("log-count").textContent = `${rows.length} / ${state.logPanelMode === "task" ? state.taskLogs.length : state.logs.length} 记录`;
 }
 
 // --------------------------------------------------------------------------- //
-// REST 调用
+// 批量操作
 // --------------------------------------------------------------------------- //
-async function api(method, url, body) {
-  const opt = { method, headers: {} };
-  if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-  const res = await fetch(url, opt);
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `${res.status}`);
-  return data;
-}
-
 function targetIds() {
   const ids = [...state.checked];
   if (!ids.length && state.selectedId) ids.push(state.selectedId);
@@ -301,16 +363,40 @@ async function createTask() {
       incremental: $("in-incremental").checked,
       verify: $("in-verify").checked,
       overwrite: $("in-overwrite").checked,
+      dest_mode: $("in-dest-mode").value,
     },
   };
   try {
     const t = await api("POST", "/api/tasks", body);
     state.selectedId = t.id;
+    // 切换到任务日志面板并拉一次
+    switchLogPanel("task");
+    loadTaskLogs(t.id, true);
     closeModal();
     $("in-name").value = ""; $("in-source").value = ""; $("in-dest").value = "";
   } catch (e) {
     $("modal-err").textContent = e.message;
   }
+}
+
+// --------------------------------------------------------------------------- //
+// 日志面板切换
+// --------------------------------------------------------------------------- //
+function switchLogPanel(mode) {
+  state.logPanelMode = mode;
+  document.querySelectorAll(".log-tab").forEach((btn) => {
+    btn.classList.toggle("active", btn.dataset.tab === mode);
+  });
+  if (mode === "task" && state.selectedId) {
+    // 切换到任务日志时全量拉一次
+    loadTaskLogs(state.selectedId, true);
+  } else if (mode === "system") {
+    // 切回系统日志时，清空 taskLogs 以免内存滞留
+    state.taskLogs = [];
+    state.taskLogSeq = 0;
+  }
+  startTaskLogPolling();
+  renderLogs();
 }
 
 // --------------------------------------------------------------------------- //
@@ -361,10 +447,18 @@ document.querySelectorAll("[data-browse]").forEach((b) => {
   b.onclick = () => openPicker(b.dataset.browse);
 });
 
+document.querySelectorAll(".log-tab").forEach((btn) => {
+  btn.onclick = () => switchLogPanel(btn.dataset.tab);
+});
+
 $("task-search").oninput = (e) => { state.search = e.target.value; renderTaskList(); };
 $("log-search").oninput = (e) => { state.logSearch = e.target.value; renderLogs(); };
 $("log-filter").onchange = (e) => { state.logFilter = e.target.value; renderLogs(); };
-$("log-clear").onclick = () => { state.logs = []; renderLogs(); };
+$("log-clear").onclick = () => {
+  if (state.logPanelMode === "system") state.logs = [];
+  else { state.taskLogs = []; state.taskLogSeq = 0; }
+  renderLogs();
+};
 
 $("select-all").onchange = (e) => {
   state.checked = e.target.checked ? new Set(visibleTasks().map((t) => t.id)) : new Set();
@@ -395,7 +489,13 @@ $("task-list").addEventListener("click", (e) => {
     return;
   }
   const card = e.target.closest(".task-card");
-  if (card) { state.selectedId = card.dataset.id; render(); }
+  if (card && card.dataset.id !== state.selectedId) {
+    state.selectedId = card.dataset.id;
+    state.taskLogs = [];
+    state.taskLogSeq = 0;
+    if (state.logPanelMode === "task") loadTaskLogs(state.selectedId, true);
+    render();
+  }
 });
 
 $("picker-list").addEventListener("click", (e) => {
@@ -412,6 +512,7 @@ document.addEventListener("keydown", (e) => {
 });
 
 // 启动
+startTaskLogPolling();
 connect();
 api("GET", "/api/logs?limit=300").then((d) => {
   state.logs = d.logs || [];

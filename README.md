@@ -20,12 +20,28 @@
 
 ## 快速开始
 
+> **Linux（Debian/Ubuntu）**：系统 Python 被 PEP 668 标记为"外部管理"，必须用虚拟环境，见下方说明。
+
 ```bash
 pip install -r requirements.txt
 python server.py
 ```
 
-打开浏览器访问 <http://127.0.0.1:8000/>。
+### Linux 虚拟环境（PEP 668）
+
+Debian 12+ / Ubuntu 23.04+ 默认启用 PEP 668，直接 `pip install` 会报 `externally-managed-environment`。解决方式：
+
+```bash
+apt install -y python3-venv          # 补齐 ensurepip（部分发行版叫 python3.12-venv）
+python3 -m venv .venv                # 创建虚拟环境
+source .venv/bin/activate           # 激活（退出用 deactivate）
+pip install -r requirements.txt      # 此时 pip 来自 venv，不受限制
+python server.py
+```
+
+> 不要用 `pipx`（只适用于命令行工具），也不要加 `--break-system-packages`（有破坏系统 Python 风险）。
+
+### 环境变量
 
 默认监听 `127.0.0.1:8000`，通过环境变量覆盖：
 

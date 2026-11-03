@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from engine import engine, longpath
+from engine import engine, longpath, normalize_dest
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATIC_DIR = os.path.join(BASE_DIR, "static")
@@ -59,13 +59,15 @@ async def _pusher() -> None:
         if not hub.clients:
             _last_log_seq = engine.log_seq
             continue
+        # 关键：先取增量，再推进本地 seq；否则 logs_since 会永远返回空
+        pending_logs = engine.logs_since(_last_log_seq, limit=200)
         _last_log_seq = engine.log_seq
         await hub.broadcast({
             "type": "update",
             "ts": time.time(),
             "tasks": engine.snapshot(),
             "aggregate": engine.aggregate(),
-            "logs": engine.logs_since(_last_log_seq, limit=200),
+            "logs": pending_logs,
         })
 
 
@@ -106,20 +108,26 @@ class CreateTaskReq(BaseModel):
 # --------------------------------------------------------------------------- #
 # 校验
 # --------------------------------------------------------------------------- #
-def validate_paths(source: str, dest: str) -> tuple[bool, str]:
+def validate_paths(source: str, dest: str, dest_mode: str = "auto") -> tuple[bool, str, str]:
+    """校验路径 + 返回归一化后的最终 dest（基于 dest_mode）。
+
+    返回 (ok, msg, normalized_dest)。调用方应使用 normalized_dest 做后续操作。
+    """
     if not source or not dest:
-        return False, "源路径与目标路径不能为空"
+        return False, "源路径与目标路径不能为空", dest
     s = os.path.abspath(source)
-    d = os.path.abspath(dest)
+    d_raw = os.path.abspath(dest)
     if not os.path.exists(longpath(s)):
-        return False, f"源路径不存在: {s}"
+        return False, f"源路径不存在: {s}", d_raw
     if not os.path.isdir(longpath(s)):
-        return False, f"源路径不是目录: {s}"
+        return False, f"源路径不是目录: {s}", d_raw
+    # 先归一化，再用最终路径做安全校验
+    d = normalize_dest(s, d_raw, dest_mode)
     if s == d:
-        return False, "目标路径不能与源路径相同"
+        return False, "目标路径不能与源路径相同（即使 dest_mode=auto 也不允许）", d
     if d.startswith(s.rstrip("\\/") + os.sep):
-        return False, "目标路径不能位于源路径内部"
-    return True, ""
+        return False, "目标路径不能位于源路径内部", d
+    return True, "", d
 
 
 def _get(tid: str):
@@ -139,10 +147,15 @@ async def list_tasks():
 
 @app.post("/api/tasks")
 async def create_task(req: CreateTaskReq):
-    ok, msg = validate_paths(req.source, req.dest)
+    dest_mode = (req.options or {}).get("dest_mode", "auto")
+    ok, msg, normalized_dest = validate_paths(req.source, req.dest, dest_mode)
     if not ok:
         return JSONResponse({"error": msg}, status_code=400)
-    task = engine.create(req.name, req.source, req.dest, req.options)
+    # 把归一化后的 dest 回写到 options，避免 Task.__init__ 再走一遍 auto 逻辑（重复但无害，更关键的是让前端/调用方看到一致结果）
+    opts = dict(req.options or {})
+    # 直接用归一化后的 dest 创建；同时把实际使用的 dest_mode 确保存在
+    opts["dest_mode"] = dest_mode
+    task = engine.create(req.name, req.source, normalized_dest, opts)
     return JSONResponse(task.snapshot(), status_code=201)
 
 
@@ -200,7 +213,25 @@ async def delete_task(tid: str):
 
 @app.get("/api/logs")
 async def get_logs(after: int = 0, task_id: str = "", level: str = "", limit: int = 400):
-    return {"logs": engine.logs_since(after, task_id, level, limit)}
+    """系统级日志（概要）。返回的 seq 为全局 engine.log_seq。"""
+    return {"logs": engine.logs_since(after, task_id, level, limit), "seq": engine.log_seq}
+
+
+@app.get("/api/tasks/{tid}/logs")
+async def get_task_logs(tid: str, after: int = 0, level: str = "", limit: int = 400):
+    """指定任务的专属日志（含每个文件的拷贝/校验细节）。
+
+    - after：该 task 的 task_log_seq 起始（0 表示从头来），返回所有 task_seq_local > after 的记录。
+    - limit：返回条数上限。
+    """
+    task = engine.tasks.get(tid)
+    if task is None:
+        return JSONResponse({"error": "任务不存在"}, status_code=404)
+    return {
+        "task_id": tid,
+        "task_seq": task.task_log_seq,
+        "logs": engine.task_logs_since(tid, after, level, limit),
+    }
 
 
 @app.get("/api/list-dirs")
