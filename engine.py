@@ -31,8 +31,9 @@ LONG_PREFIX = "\\\\?\\"
 
 # ---- 持久化相关 ----
 PERSIST_DEBOUNCE = 0.35    # 毫秒级事件合并写盘
-PERSIST_LOG_MAX_BYTES = 1 * 1024 * 1024   # 单份日志文件上限
+PERSIST_LOG_MAX_BYTES = 10 * 1024 * 1024   # 单份日志文件上限
 SCHEMA_VERSION = 1
+TASK_LOG_DISPLAY_LIMIT = 300000000
 
 DEFAULT_OPTIONS = {
     "threads": 4,          # 并发拷贝线程数
@@ -169,10 +170,12 @@ class Task:
         self._thread: threading.Thread | None = None
         self.limiter = RateLimiter(self.options["rate_limit_mb"])
         # ---- task 级独立日志 ----
-        self.task_logs: deque = deque(maxlen=3000)
+        self.task_logs: deque = deque(maxlen=TASK_LOG_DISPLAY_LIMIT)
         self.task_log_seq = 0
         self._task_log_file: object | None = None  # 延迟到 Engine 启动时打开
         self._storage_dir = storage_dir
+        # 新建任务没有历史日志，不需要懒加载；重启恢复的 task 在 from_persist 里置为 False
+        self._logs_loaded = True
         # ---- hash-on-copy：拷贝时顺手算 MD5，校验阶段零 IO ----
         self.file_md5: dict[str, tuple[str, str]] = {}  # rel → (src_md5, dst_md5) 仅成功拷贝的
         self.skipped_files: set[str] = set()             # 增量模式跳过的 rel（视为信任）
@@ -312,10 +315,12 @@ class Task:
         t._thread = None
         t.limiter = RateLimiter(t.options.get("rate_limit_mb", 0))
         # 运行态 task 日志（重启后重新打开新文件，不再依赖旧内存 deque）
-        t.task_logs = deque(maxlen=3000)
+        t.task_logs = deque(maxlen=TASK_LOG_DISPLAY_LIMIT)
         t.task_log_seq = 0
         t._task_log_file = None
         t._storage_dir = None
+        # 重启后 task 日志未加载到内存，首次访问时才从 jsonl 懒加载
+        t._logs_loaded = False
         # hash-on-copy 内存映射重启后丢失，retry 时会重新算
         t.file_md5 = {}
         t.skipped_files = set()
@@ -357,6 +362,33 @@ class Task:
                 self._task_log_file.flush()
             except OSError:
                 pass
+
+    def load_logs_from_disk(self) -> int:
+        """从 .fsync_data/task_logs/<task_id>.jsonl 把历史日志加载进内存。返回加载条数。"""
+        if self._logs_loaded or not self._storage_dir:
+            return 0
+        path = os.path.join(self._storage_dir, "task_logs", self.id + ".jsonl")
+        loaded = 0
+        try:
+            if os.path.exists(longpath(path)):
+                with open(longpath(path), "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            rec = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        seq = int(rec.get("task_seq_local", 0))
+                        if seq > self.task_log_seq:
+                            self.task_log_seq = seq
+                        self.task_logs.append(rec)
+                        loaded += 1
+        except OSError:
+            pass
+        self._logs_loaded = True
+        return loaded
 
 
 # --------------------------------------------------------------------------- #
@@ -452,9 +484,10 @@ class Storage:
 # --------------------------------------------------------------------------- #
 class Engine:
     def __init__(self, max_logs: int = 4000, storage_dir: str | None = None) -> None:
-        # 默认存储目录：与 engine.py 同目录下 .fsync_data
+        # 默认存储目录：优先 FSSYNC_DATA 环境变量，否则用当前工作目录(CWD)下的 .fsync_data
+        # 这样 PyInstaller 单文件运行时也不会跑到 sys._MEIPASS 临时目录里
         if storage_dir is None:
-            storage_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".fsync_data")
+            storage_dir = os.environ.get("FSSYNC_DATA") or os.path.join(os.getcwd(), ".fsync_data")
         self.storage = Storage(storage_dir)
         self.storage_dir = storage_dir
 
@@ -525,7 +558,8 @@ class Engine:
         except Exception:  # noqa: BLE001
             pass
 
-    def logs_since(self, seq: int, task_id: str = "", level: str = "", limit: int = 500) -> list[dict]:
+    def logs_since(self, seq: int, task_id: str = "", level: str = "", limit: int = 0) -> list[dict]:
+        """limit=0 表示不限制（返回全部）。"""
         out = []
         for rec in self.logs:
             if rec["seq"] <= seq:
@@ -535,14 +569,19 @@ class Engine:
             if level and level != "ALL" and rec["level"] != level:
                 continue
             out.append(rec)
-        return out[-limit:]
+        return out[-limit:] if limit > 0 else out
 
     def task_logs_since(self, task_id: str, seq: int = 0, level: str = "",
-                        limit: int = 500) -> list[dict]:
-        """按 task_id 返回专属日志增量。seq 为该 task 的 task_log_seq 起始，0 表示全部。"""
+                        limit: int = 0) -> list[dict]:
+        """按 task_id 返回专属日志增量。seq 为该 task 的 task_log_seq 起始，0 表示全部。
+        若该 task 的历史日志尚未加载（重启后首次访问），会先从 jsonl 懒加载进内存。
+        limit=0 表示不限制（返回全部）。"""
         task = self.tasks.get(task_id)
         if not task:
             return []
+        # 懒加载：重启后第一次拉日志时，才把磁盘上的 jsonl 读进内存
+        if not getattr(task, "_logs_loaded", True):
+            task.load_logs_from_disk()
         out = []
         for rec in task.task_logs:
             local_seq = rec.get("task_seq_local", 0)
@@ -551,7 +590,7 @@ class Engine:
             if level and level != "ALL" and rec["level"] != level:
                 continue
             out.append(rec)
-        return out[-limit:]
+        return out[-limit:] if limit > 0 else out
 
     # -- 恢复 / 持久化 ---------------------------------------------------- #
     def _revive(self) -> None:
@@ -562,6 +601,9 @@ class Engine:
         for data in rows:
             try:
                 task = Task.from_persist(data)
+                # 关键：恢复的任务要设置 _storage_dir，否则懒加载日志时读不到 jsonl 文件
+                task._storage_dir = self.storage_dir
+                task.open_log_file(self.storage_dir)
                 self.tasks[task.id] = task
                 self.order.append(task.id)
                 revived += 1

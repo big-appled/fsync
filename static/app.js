@@ -97,7 +97,6 @@ function appendSystemLogs(records) {
   const box = $("log-list");
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
   state.logs.push(...records);
-  if (state.logs.length > 2000) state.logs.splice(0, state.logs.length - 2000);
   // 只有在显示系统日志时才渲染
   if (state.logPanelMode === "system") {
     renderLogs();
@@ -124,7 +123,7 @@ async function loadTaskLogs(taskId, fullReload) {
   if (!taskId) return;
   const after = fullReload ? 0 : state.taskLogSeq;
   try {
-    const data = await api("GET", `/api/tasks/${taskId}/logs?after=${after}&limit=500`);
+    const data = await api("GET", `/api/tasks/${taskId}/logs?after=${after}`);
     const newRecords = data.logs || [];
     const box = $("log-list");
     const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 40;
@@ -136,7 +135,6 @@ async function loadTaskLogs(taskId, fullReload) {
     }
     state.taskLogSeq = data.task_seq || state.taskLogSeq;
 
-    if (state.taskLogs.length > 5000) state.taskLogs.splice(0, state.taskLogs.length - 5000);
     if (state.logPanelMode === "task") {
       renderLogs();
       if (atBottom) box.scrollTop = box.scrollHeight;

@@ -214,17 +214,17 @@ async def delete_task(tid: str):
 
 
 @app.get("/api/logs")
-async def get_logs(after: int = 0, task_id: str = "", level: str = "", limit: int = 400):
-    """系统级日志（概要）。返回的 seq 为全局 engine.log_seq。"""
+async def get_logs(after: int = 0, task_id: str = "", level: str = "", limit: int = 0):
+    """系统级日志（概要）。返回的 seq 为全局 engine.log_seq。limit=0 表示不限制。"""
     return {"logs": engine.logs_since(after, task_id, level, limit), "seq": engine.log_seq}
 
 
 @app.get("/api/tasks/{tid}/logs")
-async def get_task_logs(tid: str, after: int = 0, level: str = "", limit: int = 400):
+async def get_task_logs(tid: str, after: int = 0, level: str = "", limit: int = 0):
     """指定任务的专属日志（含每个文件的拷贝/校验细节）。
 
     - after：该 task 的 task_log_seq 起始（0 表示从头来），返回所有 task_seq_local > after 的记录。
-    - limit：返回条数上限。
+    - limit：返回条数上限，0 表示不限制。
     """
     task = engine.tasks.get(tid)
     if task is None:
