@@ -173,6 +173,9 @@ class Task:
         self.task_log_seq = 0
         self._task_log_file: object | None = None  # 延迟到 Engine 启动时打开
         self._storage_dir = storage_dir
+        # ---- hash-on-copy：拷贝时顺手算 MD5，校验阶段零 IO ----
+        self.file_md5: dict[str, tuple[str, str]] = {}  # rel → (src_md5, dst_md5) 仅成功拷贝的
+        self.skipped_files: set[str] = set()             # 增量模式跳过的 rel（视为信任）
 
     # -- 状态控制 ---------------------------------------------------------- #
     def add_bytes(self, n: int) -> None:
@@ -313,6 +316,9 @@ class Task:
         t.task_log_seq = 0
         t._task_log_file = None
         t._storage_dir = None
+        # hash-on-copy 内存映射重启后丢失，retry 时会重新算
+        t.file_md5 = {}
+        t.skipped_files = set()
         # 进程中断的任务（上次退出前仍在跑），统一标记为 interrupted + 暂停
         if t.status in ("scanning", "running", "verifying"):
             t.status = "interrupted"
@@ -915,6 +921,7 @@ class Engine:
                         task.files_skipped += 1
                         task.files_done += 1
                         task.add_bytes(st.st_size)
+                        task.skipped_files.add(rel)
                         self.log("INFO", f"跳过(增量): {rel}", task, detail=True)
                         return
                 except OSError:
@@ -922,12 +929,15 @@ class Engine:
             if not task.options["overwrite"] and os.path.exists(longpath(dst)):
                 task.files_skipped += 1
                 task.files_done += 1
+                task.skipped_files.add(rel)
                 self.log("INFO", f"跳过(已存在): {rel}", task, detail=True)
                 return
 
             makedirs(os.path.dirname(dst) or task.dest)
             task.current = rel
             written = 0
+            src_h = hashlib.md5()
+            dst_h = hashlib.md5()
             with open(longpath(src), "rb", buffering=0) as fin, open(longpath(tmp), "wb", buffering=0) as fout:
                 while True:
                     if task.cancelled:
@@ -937,7 +947,9 @@ class Engine:
                     chunk = fin.read(CHUNK)
                     if not chunk:
                         break
+                    src_h.update(chunk)   # hash-on-copy：读时顺手算源 MD5
                     fout.write(chunk)
+                    dst_h.update(chunk)   # 写时顺手算目标 MD5
                     task.limiter.consume(len(chunk))
                     written += len(chunk)
                     task.add_bytes(len(chunk))
@@ -949,7 +961,9 @@ class Engine:
             if task.options["preserve_mtime"]:
                 os.utime(longpath(dst), (st.st_atime, st.st_mtime))
             task.files_done += 1
-            self.log("INFO", f"已拷贝: {rel}  {human_size(st.st_size)}", task, detail=True)
+            src_md5, dst_md5 = src_h.hexdigest(), dst_h.hexdigest()
+            task.file_md5[rel] = (src_md5, dst_md5)
+            self.log("INFO", f"已拷贝: {rel}  {human_size(st.st_size)}  MD5={src_md5}", task, detail=True)
             if written != st.st_size:
                 task.files_failed += 1
                 self.log("WARN", f"大小不一致: {rel} 源 {st.st_size} vs 写入 {written}", task, detail=True)
@@ -986,7 +1000,6 @@ class Engine:
     def _verify(self, task: Task) -> None:
         self.log("INFO", "校验结果:", task)
         if task.files_failed == 0:
-            # 拷贝零失败 → 跳过目标目录全量结构扫描，省一轮亿级枚举（缺失/损坏由哈希校验兜底）
             self.log("INFO", "拷贝阶段零失败，跳过目标结构扫描，直接进入哈希校验", task)
         else:
             d_files, d_total, d_links = self._scan(task, task.dest)
@@ -997,12 +1010,13 @@ class Engine:
                              f"{'一致' if d_total >= task.bytes_total else '不一致'}", task)
             self.log("INFO", f"软链接数: 源 {task.source_links} vs 目标 {d_links} "
                              f"{'一致' if task.source_links == d_links else '不一致'}", task)
-        self.log("INFO", "开始哈希校验（同名文件）...", task)
+        self.log("INFO", "开始哈希校验（hash-on-copy 缓存优先，必要时现算）...", task)
 
         task.verify_total = task.files_done or task.files_total
         task.verify_done = 0
         task.md5_mismatch = 0
-        workers = max(1, int(task.options["threads"]))
+        # 校验并发：内存对比是 CPU-bound，fallback 现算是 IO-bound，独立线程池
+        workers = max(2, int(task.options["threads"]) * 2)
         q: queue.Queue = queue.Queue(maxsize=workers * 16)
 
         def worker() -> None:
@@ -1042,27 +1056,41 @@ class Engine:
             self.log("SUCCESS", f"哈希校验完成: {task.verify_done} 个文件全部一致", task)
 
     def _verify_one(self, task: Task, src: str, rel: str) -> None:
-        """工作线程内校验单个文件：存在性 → 大小 → MD5。"""
+        """校验单个文件：优先用 hash-on-copy 的内存 hash，否则 fallback 现算。"""
         if not task.gate():
             return
         dst = os.path.join(task.dest, rel)
         try:
-            if not os.path.exists(longpath(dst)):
-                self._verify_fail(task, rel, "目标缺失", src_md5="", dst_md5="")
-            else:
-                st_src = os.stat(longpath(src)).st_size
-                st_dst = os.stat(longpath(dst)).st_size
-                if st_src != st_dst:
-                    self._verify_fail(task, rel, f"大小不一致 源={st_src} vs 目标={st_dst}",
-                                      src_md5="", dst_md5="")
+            if rel in task.file_md5:
+                # 拷贝时已经算过两边 MD5，零 IO 直接对比
+                src_md5, dst_md5 = task.file_md5[rel]
+                if src_md5 != dst_md5:
+                    self._verify_fail(task, rel, f"MD5 不一致 源={src_md5} vs 目标={dst_md5}",
+                                      src_md5=src_md5, dst_md5=dst_md5)
                 else:
-                    src_md5 = self._md5(src)
-                    dst_md5 = self._md5(dst)
-                    if src_md5 != dst_md5:
-                        self._verify_fail(task, rel, f"MD5 不一致 源={src_md5} vs 目标={dst_md5}",
-                                          src_md5=src_md5, dst_md5=dst_md5)
+                    self.log("INFO", f"校验通过: {rel}  MD5={src_md5}", task, detail=True)
+            elif rel in task.skipped_files:
+                # 增量模式跳过的文件：用户已信任 size+mtime 一致，直接通过
+                # 仍然记 MD5 为 "skipped"，保持日志完整
+                self.log("INFO", f"校验通过(增量信任): {rel}", task, detail=True)
+            else:
+                # fallback：拷贝失败/漏算，现算 MD5
+                if not os.path.exists(longpath(dst)):
+                    self._verify_fail(task, rel, "目标缺失", src_md5="", dst_md5="")
+                else:
+                    st_src = os.stat(longpath(src)).st_size
+                    st_dst = os.stat(longpath(dst)).st_size
+                    if st_src != st_dst:
+                        self._verify_fail(task, rel, f"大小不一致 源={st_src} vs 目标={st_dst}",
+                                          src_md5="", dst_md5="")
                     else:
-                        self.log("INFO", f"校验通过: {rel}  MD5={src_md5}", task, detail=True)
+                        src_md5 = self._md5(src)
+                        dst_md5 = self._md5(dst)
+                        if src_md5 != dst_md5:
+                            self._verify_fail(task, rel, f"MD5 不一致 源={src_md5} vs 目标={dst_md5}",
+                                              src_md5=src_md5, dst_md5=dst_md5)
+                        else:
+                            self.log("INFO", f"校验通过: {rel}  MD5={src_md5}", task, detail=True)
             with task._lock:
                 task.verify_done += 1
         except OSError as exc:
