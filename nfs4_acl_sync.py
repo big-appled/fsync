@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """按目录层级同步 NFSv4 ACL。
 
-读取源目录「第 N 层」各目录的 ACL（使用环境中的 nfs4_getacl），
+需要安装nfs4-acl-tools包
+
+读取源目录「第 N 层」各目录的 ACL（使用环境中的 nfs4_getfacl），
 写入目标目录中与之对应的目录（默认按相同相对路径匹配，可选按同名目录匹配）。
 
 用法示例:
@@ -11,8 +13,8 @@
     python3 nfs4_acl_sync.py /data/src /data/dst --depth 1 --dry-run
 
 默认命令调用方式（可通过 --get-cmd / --set-cmd / --set-flag / --set-mode 调整）:
-    nfs4_getacl <源目录>
-    nfs4_setacl -f <临时ACL文件> <目标目录>
+    nfs4_getfacl <源目录>
+    nfs4_setfacl -f <临时ACL文件> <目标目录>
 
 说明:
     depth=1 表示源目录的直接子目录，depth=0 表示源目录本身；脚本只处理该层目录，
@@ -163,7 +165,7 @@ def sync_one(
 
         entries = parse_acl_entries(proc.stdout)
         if not entries:
-            return Result(src_rel, dst_rel, "failed", "源目录 ACL 为空（nfs4_getacl 无有效条目）")
+            return Result(src_rel, dst_rel, "failed", "源目录 ACL 为空（nfs4_getfacl 无有效条目）")
 
         acl_text = "\n".join(entries) + "\n"
         acl_file = Path(workdir) / ("%d.acl" % idx)
@@ -251,8 +253,8 @@ def build_parser() -> argparse.ArgumentParser:
             "  python3 nfs4_acl_sync.py /data/src /data/dst --depth 2 --match auto\n"
             "\n"
             "默认命令调用:\n"
-            "  nfs4_getacl <源目录>\n"
-            "  nfs4_setacl -f <临时ACL文件> <目标目录>\n"
+            "  nfs4_getfacl <源目录>\n"
+            "  nfs4_setfacl -f <临时ACL文件> <目标目录>\n"
         ),
     )
     parser.add_argument("source", help="源目录")
@@ -270,8 +272,8 @@ def build_parser() -> argparse.ArgumentParser:
         default="path",
         help="目标匹配方式：path=仅相同相对路径；auto=相对路径不存在时再按同名目录唯一匹配（默认: path）",
     )
-    parser.add_argument("--get-cmd", default="nfs4_getacl", help="读取 ACL 的命令（默认: nfs4_getacl）")
-    parser.add_argument("--set-cmd", default="nfs4_setacl", help="写入 ACL 的命令（默认: nfs4_setacl）")
+    parser.add_argument("--get-cmd", default="nfs4_getfacl", help="读取 ACL 的命令（默认: nfs4_getfacl）")
+    parser.add_argument("--set-cmd", default="nfs4_setfacl", help="写入 ACL 的命令（默认: nfs4_setfacl）")
     parser.add_argument(
         "--set-flag",
         default="-f",
